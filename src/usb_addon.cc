@@ -4,6 +4,7 @@
 #include <setupapi.h>
 #include <initguid.h>
 #include <usbprint.h>
+#include <regex>
 
 Napi::FunctionReference UsbDevice::constructor;
 
@@ -220,10 +221,50 @@ LRESULT CALLBACK UsbDevice::WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
     if (uMsg == WM_DEVICECHANGE) {
         auto device = reinterpret_cast<UsbDevice*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
         if (device && device->tsfn) {
-            bool isAttached = (wParam == DBT_DEVICEARRIVAL);
-            device->tsfn.BlockingCall(&isAttached, [](Napi::Env env, Napi::Function jsCallback, bool* data) {
-                jsCallback.Call({Napi::Boolean::New(env, *data)});
-            });
+            const char* eventType = nullptr;
+            if (wParam == DBT_DEVICEARRIVAL) {
+                eventType = "Arrival";
+            } else if (wParam == DBT_DEVICEREMOVECOMPLETE) {
+                eventType = "Remove";
+            }
+
+            if (eventType) {
+                DEV_BROADCAST_DEVICEINTERFACE_A* devInterface = (DEV_BROADCAST_DEVICEINTERFACE_A*)lParam;
+                std::string devicePath = devInterface->dbcc_name;
+
+                // 使用正则表达式提取VID和PID
+                std::regex vidPidRegex("VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})");
+                std::smatch match;
+                std::string vid = "Unknown";
+                std::string pid = "Unknown";
+
+                if (std::regex_search(devicePath, match, vidPidRegex) && match.size() == 3) {
+                    vid = match.str(1);
+                    pid = match.str(2);
+                }
+
+                // 创建一个结构来传递事件信息
+                struct HotplugEvent {
+                    std::string type;
+                    std::string vid;
+                    std::string pid;
+                };
+
+                auto event = new HotplugEvent{eventType, vid, pid};
+
+                device->tsfn.BlockingCall(event, [](Napi::Env env, Napi::Function jsCallback, HotplugEvent* event) {
+                    // 创建参数
+                    Napi::String jsEventType = Napi::String::New(env, event->type);
+                    Napi::String jsVid = Napi::String::New(env, event->vid);
+                    Napi::String jsPid = Napi::String::New(env, event->pid);
+
+                    // 调用JavaScript回调
+                    jsCallback.Call({jsEventType, jsVid, jsPid});
+
+                    // 清理
+                    delete event;
+                });
+            }
         }
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
@@ -244,7 +285,7 @@ void UsbDevice::NotificationThreadProc() {
     DEV_BROADCAST_DEVICEINTERFACE notificationFilter = { 0 };
     notificationFilter.dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE);
     notificationFilter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-    notificationFilter.dbcc_classguid = GUID_DEVINTERFACE_USB_DEVICE;
+    notificationFilter.dbcc_classguid = GUID_DEVINTERFACE_USBPRINT;
 
     deviceNotificationHandle = RegisterDeviceNotification(hwnd,
         &notificationFilter, DEVICE_NOTIFY_WINDOW_HANDLE);

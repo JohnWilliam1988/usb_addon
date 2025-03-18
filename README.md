@@ -6,39 +6,6 @@
 - 发送进度监控
 - USB 设备热插拔监控
 
-## 系统要求
-
-- Node.js 14.x 或更高版本
-- libusb 1.0
-- Windows 或 Linux 操作系统
-- 用于编译的构建工具（Windows: Visual Studio，Linux: GCC）
-
-## 安装
-
-### Windows
-
-1. 安装 libusb：
-   - 下载并安装 [libusb](https://github.com/libusb/libusb/releases)
-   - 设置环境变量 `LIBUSB_DIR` 指向 libusb 安装目录
-
-2. 安装模块：
-```bash
-npm install
-```
-
-### Linux
-
-1. 安装 libusb：
-```bash
-sudo apt-get install libusb-1.0-0-dev  # Ubuntu/Debian
-# 或
-sudo yum install libusb1-devel         # CentOS/RHEL
-```
-
-2. 安装模块：
-```bash
-npm install
-```
 
 ## 使用示例
 
