@@ -36,6 +36,7 @@ private:
     Napi::Value Connect(const Napi::CallbackInfo& info);
     Napi::Value Disconnect(const Napi::CallbackInfo& info);
     Napi::Value SendData(const Napi::CallbackInfo& info);
+    Napi::Value SendDataWithResponse(const Napi::CallbackInfo& info);
     Napi::Value GetSendProgress(const Napi::CallbackInfo& info);
     Napi::Value StartHotplugMonitor(const Napi::CallbackInfo& info);
     Napi::Value StopHotplugMonitor(const Napi::CallbackInfo& info);
