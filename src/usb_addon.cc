@@ -29,7 +29,13 @@ UsbDevice::UsbDevice(const Napi::CallbackInfo &info)
     shouldStopNotification = false;
     deviceNotificationHandle = NULL;
     sendProgress = 0.0;
-
+    isOperationInProgress = false;
+    
+    // 初始化 OVERLAPPED 结构
+    ZeroMemory(&osWrite, sizeof(OVERLAPPED));
+    ZeroMemory(&osRead, sizeof(OVERLAPPED));
+    osWrite.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    osRead.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 }
 
 UsbDevice::~UsbDevice()
@@ -49,6 +55,18 @@ UsbDevice::~UsbDevice()
     {
         shouldStopNotification = true;
         notificationThread.join();
+    }
+
+    // 清理 OVERLAPPED 事件句柄
+    if (osWrite.hEvent)
+    {
+        CloseHandle(osWrite.hEvent);
+        osWrite.hEvent = NULL;
+    }
+    if (osRead.hEvent)
+    {
+        CloseHandle(osRead.hEvent);
+        osRead.hEvent = NULL;
     }
 }
 
@@ -149,6 +167,34 @@ Napi::Value UsbDevice::Connect(const Napi::CallbackInfo &info)
         return env.Null();
     }
 
+    // 如果已经连接，先断开连接并清理资源
+    if (isConnected)
+    {
+        // 取消所有待处理的 I/O 操作
+        CancelIo(deviceHandle);
+        
+        // 关闭现有的事件句柄
+        if (osRead.hEvent)
+        {
+            CloseHandle(osRead.hEvent);
+            osRead.hEvent = NULL;
+        }
+        if (osWrite.hEvent)
+        {
+            CloseHandle(osWrite.hEvent);
+            osWrite.hEvent = NULL;
+        }
+
+        // 关闭设备句柄
+        if (deviceHandle != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(deviceHandle);
+            deviceHandle = INVALID_HANDLE_VALUE;
+        }
+        
+        isConnected = false;
+    }
+
     WORD vendorId = (WORD)info[0].As<Napi::Number>().Uint32Value();
     WORD productId = (WORD)info[1].As<Napi::Number>().Uint32Value();
 
@@ -161,30 +207,47 @@ Napi::Value UsbDevice::Connect(const Napi::CallbackInfo &info)
         return Napi::Boolean::New(env, false);
     }
 
-    // 打开设备进行写入
+    // 打开设备
     deviceHandle = CreateFileA(devicePath.c_str(),
-                               GENERIC_WRITE | GENERIC_READ,
-                               0,
-                               NULL,
-                               OPEN_EXISTING,
-                               FILE_FLAG_OVERLAPPED,
-                               NULL);
+                             GENERIC_READ | GENERIC_WRITE,
+                             0,  // 不共享
+                             NULL,
+                             OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                             NULL);
 
     if (deviceHandle == INVALID_HANDLE_VALUE)
     {
-        DWORD error = GetLastError();
-        std::cerr << "Failed to open device, error: " << error << std::endl;
+        std::cout << "Failed to open device: " << GetLastError() << std::endl;
         return Napi::Boolean::New(env, false);
     }
 
-    if (!InitializeDevice(deviceHandle))
+    // 初始化重叠IO结构
+    memset(&osRead, 0, sizeof(OVERLAPPED));
+    memset(&osWrite, 0, sizeof(OVERLAPPED));
+    
+    // 创建新的事件
+    osRead.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    osWrite.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    if (!osRead.hEvent || !osWrite.hEvent)
     {
+        std::cout << "Failed to create events" << std::endl;
+        
+        // 清理资源
+        if (osRead.hEvent) CloseHandle(osRead.hEvent);
+        if (osWrite.hEvent) CloseHandle(osWrite.hEvent);
         CloseHandle(deviceHandle);
         deviceHandle = INVALID_HANDLE_VALUE;
         return Napi::Boolean::New(env, false);
     }
 
+    // 重置其他状态
+    sendProgress = 0.0;
+    isOperationInProgress = false;
+
     isConnected = true;
+    std::cout << "Device connected successfully" << std::endl;
     return Napi::Boolean::New(env, true);
 }
 
@@ -228,7 +291,7 @@ Napi::Value UsbDevice::SendData(const Napi::CallbackInfo &info)
     }
 
     Napi::Buffer<uint8_t> buffer = info[0].As<Napi::Buffer<uint8_t>>();
-    
+
     if (buffer.Length() == 0)
     {
         Napi::Error::New(env, "Empty buffer").ThrowAsJavaScriptException();
@@ -296,217 +359,173 @@ Napi::Value UsbDevice::SendDataWithResponse(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
 
-    if (!isConnected)
-    {
-        Napi::Error::New(env, "Device not connected").ThrowAsJavaScriptException();
-        return env.Null();
-    }
-
-    if (deviceHandle == INVALID_HANDLE_VALUE)
-    {
-        Napi::Error::New(env, "Invalid device handle").ThrowAsJavaScriptException();
-        return env.Null();
-    }
-
-    if (info.Length() < 1 || !info[0].IsBuffer())
-    {
-        Napi::TypeError::New(env, "Expected buffer as argument").ThrowAsJavaScriptException();
-        return env.Null();
-    }
-
-    Napi::Buffer<uint8_t> buffer = info[0].As<Napi::Buffer<uint8_t>>();
-    
-    if (buffer.Length() == 0)
-    {
-        Napi::Error::New(env, "Empty buffer").ThrowAsJavaScriptException();
-        return env.Null();
-    }
-
-    // 初始化 OVERLAPPED 结构
-    OVERLAPPED osWrite = {0};
-    osWrite.Offset = 0;
-    osWrite.OffsetHigh = 0;
-    OVERLAPPED osRead = {0};
-    osRead.Offset = 0;
-    osRead.OffsetHigh = 0;
-    // 创建事件
-    osWrite.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    osRead.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-
-    if (osWrite.hEvent == NULL || osRead.hEvent == NULL)
-    {
-        if (osWrite.hEvent)
-            CloseHandle(osWrite.hEvent);
-        if (osRead.hEvent)
-            CloseHandle(osRead.hEvent);
-        std::cout << "Failed to create events" << std::endl;
-        Napi::Error::New(env, "Failed to create events").ThrowAsJavaScriptException();
-        return env.Null();
-    }
-
-    // 写入数据
-    DWORD bytesWritten = 0;
-    std::cout << "Writing data to device..." << std::endl;
-
-    // 取消任何未完成的 I/O 操作
-    CancelIo(deviceHandle);
-    
-    // 清空设备缓冲区
-    PurgeComm(deviceHandle, PURGE_RXCLEAR | PURGE_TXCLEAR);
-
-    BOOL writeResult = WriteFile(
-        deviceHandle,
-        buffer.Data(),
-        static_cast<DWORD>(buffer.Length()),
-        &bytesWritten,
-        &osWrite);
-
-    if (!writeResult)
-    {
-        DWORD error = GetLastError();
-        if (error != ERROR_IO_PENDING)
+    try {
+        if (!isConnected || deviceHandle == INVALID_HANDLE_VALUE)
         {
-            CloseHandle(osWrite.hEvent);
-            CloseHandle(osRead.hEvent);
-            Napi::Error::New(env, "Failed to write data: " + std::to_string(error)).ThrowAsJavaScriptException();
+            Napi::Error::New(env, "Device not connected").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+
+        if (info.Length() < 1 || !info[0].IsBuffer())
+        {
+            Napi::TypeError::New(env, "Expected buffer as argument").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+
+        Napi::Buffer<uint8_t> buffer = info[0].As<Napi::Buffer<uint8_t>>();
+        if (buffer.Length() == 0)
+        {
+            Napi::Error::New(env, "Empty buffer").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+
+        // 写入数据
+        DWORD bytesWritten = 0;
+
+        // 重置写入事件和OVERLAPPED结构
+        memset(&osWrite, 0, sizeof(OVERLAPPED));
+        if (osWrite.hEvent) CloseHandle(osWrite.hEvent);
+        osWrite.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (!osWrite.hEvent)
+        {
+            std::cout << "Failed to create write event" << std::endl;
+            return env.Null();
+        }
+
+        // 写入数据
+        BOOL writeResult = WriteFile(
+            deviceHandle,
+            buffer.Data(),
+            static_cast<DWORD>(buffer.Length()),
+            &bytesWritten,
+            &osWrite);
+
+        if (!writeResult && GetLastError() != ERROR_IO_PENDING)
+        {
+            std::cout << "Write failed: " << GetLastError() << std::endl;
             return env.Null();
         }
 
         // 等待写入完成
-        DWORD waitResult = WaitForSingleObject(osWrite.hEvent, 1000); // 1秒超时
-        if (waitResult == WAIT_TIMEOUT)
+        DWORD waitResult = WaitForSingleObject(osWrite.hEvent, 500);  // 增加到1000ms
+        if (waitResult != WAIT_OBJECT_0)
         {
-            CloseHandle(osWrite.hEvent);
-            CloseHandle(osRead.hEvent);
+            std::cout << "Write timeout or error" << std::endl;
             CancelIo(deviceHandle);
-            Napi::Error::New(env, "Write operation timed out").ThrowAsJavaScriptException();
             return env.Null();
         }
 
-        // 获取写入结果
-        if (!GetOverlappedResult(deviceHandle, &osWrite, &bytesWritten, TRUE))
+        if (!GetOverlappedResult(deviceHandle, &osWrite, &bytesWritten, FALSE))
         {
-            DWORD finalError = GetLastError();
-            CloseHandle(osWrite.hEvent);
-            CloseHandle(osRead.hEvent);
-            Napi::Error::New(env, "Failed to complete write operation: " + std::to_string(finalError)).ThrowAsJavaScriptException();
+            std::cout << "Write completion failed: " << GetLastError() << std::endl;
             return env.Null();
         }
-    }
 
-    std::cout << "Write complete, bytes written: " << bytesWritten << std::endl;
+        // std::cout << "Write complete, bytes written: " << bytesWritten << std::endl;
 
-    // 动态等待时间，根据数据大小调整
-    DWORD waitTime = static_cast<DWORD>(std::min<size_t>(100 + static_cast<size_t>(buffer.Length()) / 64 * 10, 200));  // 最少100ms，最多200ms
-    Sleep(waitTime);
+        // 等待设备处理
+        Sleep(200);  // 给设备一些处理时间
 
-    // 读取响应
-    std::vector<uint8_t> responseBuffer;
-    const DWORD bufferSize = 1024;
-    std::vector<uint8_t> tempBuffer(bufferSize);
-    DWORD totalBytesRead = 0;
-    const DWORD maxAttempts = 5;  // 最大尝试次数
-    const DWORD singleReadTimeout = 400;  // 每次读取超时时间
-    
-    for (DWORD attempt = 0; attempt < maxAttempts; attempt++)
-    {
-        DWORD bytesRead = 0;
-        ResetEvent(osRead.hEvent);  // 重置事件
+        // 准备读取
+        const DWORD READ_BUFFER_SIZE = 1024;
+        std::vector<uint8_t> readBuffer(READ_BUFFER_SIZE, 0);
+        std::vector<uint8_t> responseBuffer;
+        DWORD totalBytesRead = 0;
+        int readAttempts = 0;
+        const int MAX_READ_ATTEMPTS = 5;
+        bool dataReceived = false;
 
-        BOOL readResult = ReadFile(
-            deviceHandle,
-            tempBuffer.data(),
-            bufferSize,
-            &bytesRead,
-            &osRead);
-
-        if (!readResult)
+        // 主读取循环
+        while (readAttempts < MAX_READ_ATTEMPTS && !dataReceived)
         {
-            DWORD error = GetLastError();
-            if (error != ERROR_IO_PENDING)
-            {
-                if (totalBytesRead > 0)
-                {
-                    // 如果已经读取到一些数据，就返回
-                    break;
-                }
-                CloseHandle(osWrite.hEvent);
-                CloseHandle(osRead.hEvent);
-                Napi::Error::New(env, "Failed to read response: " + std::to_string(error)).ThrowAsJavaScriptException();
-                return env.Null();
-            }
+            readAttempts++;
+            std::cout << "Read attempt " << readAttempts << std::endl;
 
-            // 等待读取完成
-            DWORD waitResult = WaitForSingleObject(osRead.hEvent, singleReadTimeout);
-            if (waitResult == WAIT_TIMEOUT)
+            // 重置读取事件和OVERLAPPED结构
+            memset(&osRead, 0, sizeof(OVERLAPPED));
+            if (osRead.hEvent) CloseHandle(osRead.hEvent);
+            osRead.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+            if (!osRead.hEvent)
             {
-                if (totalBytesRead > 0)
-                {
-                    // 如果已经读取到数据，就认为完成了
-                    break;
-                }
-                if (attempt == maxAttempts - 1)
-                {
-                    // 最后一次尝试才报超时
-                    CloseHandle(osWrite.hEvent);
-                    CloseHandle(osRead.hEvent);
-                    CancelIo(deviceHandle);
-                    Napi::Error::New(env, "Read operation timed out").ThrowAsJavaScriptException();
-                    return env.Null();
-                }
-                continue;  // 继续尝试
-            }
-
-            // 获取读取结果
-            if (!GetOverlappedResult(deviceHandle, &osRead, &bytesRead, FALSE))
-            {
-                DWORD finalError = GetLastError();
-                if (finalError == ERROR_IO_INCOMPLETE)
-                {
-                    if (totalBytesRead > 0)
-                    {
-                        break;
-                    }
-                    continue;  // 继续尝试
-                }
-                CloseHandle(osWrite.hEvent);
-                CloseHandle(osRead.hEvent);
-                Napi::Error::New(env, "Failed to complete read operation: " + std::to_string(finalError)).ThrowAsJavaScriptException();
-                return env.Null();
-            }
-        }
-
-        if (bytesRead > 0)
-        {
-            responseBuffer.insert(responseBuffer.end(), tempBuffer.begin(), tempBuffer.begin() + bytesRead);
-            totalBytesRead += bytesRead;
-            
-            // 如果缓冲区未满，可能已经读取完所有数据
-            if (bytesRead < bufferSize)
-            {
+                std::cout << "Failed to create read event" << std::endl;
                 break;
             }
+
+            DWORD bytesRead = 0;
+            BOOL readResult = ReadFile(
+                deviceHandle,
+                readBuffer.data(),
+                READ_BUFFER_SIZE,
+                &bytesRead,
+                &osRead);
+
+            if (!readResult)
+            {
+                DWORD error = GetLastError();
+                if (error != ERROR_IO_PENDING)
+                {
+                    std::cout << "Read error: " << error << std::endl;
+                    Sleep(100);
+                    continue;
+                }
+
+                // 等待读取完成或超时
+                waitResult = WaitForSingleObject(osRead.hEvent, 500);  // 增加到1000ms
+                if (waitResult == WAIT_TIMEOUT)
+                {
+                    // std::cout << "Read timeout in attempt " << readAttempts << std::endl;
+                    CancelIo(deviceHandle);
+                    Sleep(100);
+                    continue;
+                }
+                else if (waitResult != WAIT_OBJECT_0)
+                {
+                    std::cout << "Read wait error: " << GetLastError() << std::endl;
+                    break;
+                }
+
+                if (!GetOverlappedResult(deviceHandle, &osRead, &bytesRead, FALSE))
+                {
+                    DWORD error = GetLastError();
+                    std::cout << "GetOverlappedResult error: " << error << std::endl;
+                    break;
+                }
+            }
+
+            if (bytesRead > 0)
+            {
+                std::cout << "Read " << bytesRead << " bytes in attempt " << readAttempts << std::endl;
+
+                responseBuffer.insert(responseBuffer.end(), 
+                                   readBuffer.begin(), 
+                                   readBuffer.begin() + bytesRead);
+                totalBytesRead += bytesRead;
+                dataReceived = true;
+            }
+            else
+            {
+                std::cout << "No data read in attempt " << readAttempts << std::endl;
+                Sleep(100);
+            }
         }
-        else if (totalBytesRead > 0)
+
+        if (totalBytesRead > 0)
         {
-            // 如果这次没读到数据，但之前读到过，就认为完成了
-            break;
+            // std::cout << "Total bytes read: " << totalBytesRead << std::endl;
+            return Napi::Buffer<uint8_t>::Copy(env, responseBuffer.data(), responseBuffer.size());
         }
+
+        std::cout << "No data received after all attempts" << std::endl;
+        return Napi::Buffer<uint8_t>::Copy(env, "", 0);
     }
-
-    // 清理资源
-    CloseHandle(osWrite.hEvent);
-    CloseHandle(osRead.hEvent);
-
-    // 如果读取到数据，则返回
-    if (totalBytesRead > 0)
-    {
-        std::cout << "Read complete, total bytes read: " << totalBytesRead << std::endl;
-        return Napi::Buffer<uint8_t>::Copy(env, responseBuffer.data(), responseBuffer.size());
+    catch (const std::exception& e) {
+        std::cout << "Exception in SendDataWithResponse: " << e.what() << std::endl;
+        return env.Null();
     }
-
-    std::cout << "No response from device" << std::endl;
-    return Napi::Buffer<uint8_t>::Copy(env, responseBuffer.data(), responseBuffer.size());
+    catch (...) {
+        std::cout << "Unknown exception in SendDataWithResponse" << std::endl;
+        return env.Null();
+    }
 }
 
 Napi::Value UsbDevice::GetSendProgress(const Napi::CallbackInfo &info)
