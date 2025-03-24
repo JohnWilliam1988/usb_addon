@@ -30,12 +30,6 @@ UsbDevice::UsbDevice(const Napi::CallbackInfo &info)
     deviceNotificationHandle = NULL;
     sendProgress = 0.0;
     isOperationInProgress = false;
-    
-    // 初始化 OVERLAPPED 结构
-    ZeroMemory(&osWrite, sizeof(OVERLAPPED));
-    ZeroMemory(&osRead, sizeof(OVERLAPPED));
-    osWrite.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    osRead.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 }
 
 UsbDevice::~UsbDevice()
@@ -55,18 +49,6 @@ UsbDevice::~UsbDevice()
     {
         shouldStopNotification = true;
         notificationThread.join();
-    }
-
-    // 清理 OVERLAPPED 事件句柄
-    if (osWrite.hEvent)
-    {
-        CloseHandle(osWrite.hEvent);
-        osWrite.hEvent = NULL;
-    }
-    if (osRead.hEvent)
-    {
-        CloseHandle(osRead.hEvent);
-        osRead.hEvent = NULL;
     }
 }
 
@@ -172,26 +154,6 @@ Napi::Value UsbDevice::Connect(const Napi::CallbackInfo &info)
     {
         // 取消所有待处理的 I/O 操作
         CancelIo(deviceHandle);
-        
-        // 关闭现有的事件句柄
-        if (osRead.hEvent)
-        {
-            CloseHandle(osRead.hEvent);
-            osRead.hEvent = NULL;
-        }
-        if (osWrite.hEvent)
-        {
-            CloseHandle(osWrite.hEvent);
-            osWrite.hEvent = NULL;
-        }
-
-        // 关闭设备句柄
-        if (deviceHandle != INVALID_HANDLE_VALUE)
-        {
-            CloseHandle(deviceHandle);
-            deviceHandle = INVALID_HANDLE_VALUE;
-        }
-        
         isConnected = false;
     }
 
@@ -219,26 +181,6 @@ Napi::Value UsbDevice::Connect(const Napi::CallbackInfo &info)
     if (deviceHandle == INVALID_HANDLE_VALUE)
     {
         std::cout << "Failed to open device: " << GetLastError() << std::endl;
-        return Napi::Boolean::New(env, false);
-    }
-
-    // 初始化重叠IO结构
-    memset(&osRead, 0, sizeof(OVERLAPPED));
-    memset(&osWrite, 0, sizeof(OVERLAPPED));
-    
-    // 创建新的事件
-    osRead.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    osWrite.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-
-    if (!osRead.hEvent || !osWrite.hEvent)
-    {
-        std::cout << "Failed to create events" << std::endl;
-        
-        // 清理资源
-        if (osRead.hEvent) CloseHandle(osRead.hEvent);
-        if (osWrite.hEvent) CloseHandle(osWrite.hEvent);
-        CloseHandle(deviceHandle);
-        deviceHandle = INVALID_HANDLE_VALUE;
         return Napi::Boolean::New(env, false);
     }
 
@@ -381,7 +323,7 @@ Napi::Value UsbDevice::SendDataWithResponse(const Napi::CallbackInfo &info)
 
         // 写入数据
         DWORD bytesWritten = 0;
-
+        OVERLAPPED osWrite = {0};
         // 重置写入事件和OVERLAPPED结构
         memset(&osWrite, 0, sizeof(OVERLAPPED));
         if (osWrite.hEvent) CloseHandle(osWrite.hEvent);
@@ -442,6 +384,7 @@ Napi::Value UsbDevice::SendDataWithResponse(const Napi::CallbackInfo &info)
             std::cout << "Read attempt " << readAttempts << std::endl;
 
             // 重置读取事件和OVERLAPPED结构
+            OVERLAPPED osRead = {0};
             memset(&osRead, 0, sizeof(OVERLAPPED));
             if (osRead.hEvent) CloseHandle(osRead.hEvent);
             osRead.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -470,7 +413,7 @@ Napi::Value UsbDevice::SendDataWithResponse(const Napi::CallbackInfo &info)
                 }
 
                 // 等待读取完成或超时
-                waitResult = WaitForSingleObject(osRead.hEvent, 500);  // 增加到1000ms
+                waitResult = WaitForSingleObject(osRead.hEvent, 50);  // 增加到1000ms
                 if (waitResult == WAIT_TIMEOUT)
                 {
                     // std::cout << "Read timeout in attempt " << readAttempts << std::endl;
@@ -516,7 +459,7 @@ Napi::Value UsbDevice::SendDataWithResponse(const Napi::CallbackInfo &info)
         }
 
         std::cout << "No data received after all attempts" << std::endl;
-        return Napi::Buffer<uint8_t>::Copy(env, "", 0);
+        return env.Null();
     }
     catch (const std::exception& e) {
         std::cout << "Exception in SendDataWithResponse: " << e.what() << std::endl;

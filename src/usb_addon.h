@@ -25,13 +25,9 @@ private:
     HDEVNOTIFY deviceNotificationHandle;
     
     // 数据传输相关
-    std::queue<std::vector<uint8_t>> sendQueue;
-    std::mutex sendQueueMutex;
     double sendProgress;
     bool isOperationInProgress;
-    OVERLAPPED osWrite;
-    OVERLAPPED osRead;
-
+    
     // JavaScript回调函数
     Napi::ThreadSafeFunction tsfn;
 
