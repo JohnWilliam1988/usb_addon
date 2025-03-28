@@ -12,7 +12,15 @@ Napi::Object UsbDevice::Init(Napi::Env env, Napi::Object exports)
 {
     Napi::HandleScope scope(env);
 
-    Napi::Function func = DefineClass(env, "UsbDevice", {InstanceMethod("connect", &UsbDevice::Connect), InstanceMethod("disconnect", &UsbDevice::Disconnect), InstanceMethod("sendData", &UsbDevice::SendData), InstanceMethod("sendDataWithResponse", &UsbDevice::SendDataWithResponse), InstanceMethod("getSendProgress", &UsbDevice::GetSendProgress), InstanceMethod("startHotplugMonitor", &UsbDevice::StartHotplugMonitor), InstanceMethod("stopHotplugMonitor", &UsbDevice::StopHotplugMonitor)});
+    Napi::Function func = DefineClass(env, "UsbDevice", {
+        InstanceMethod("connect", &UsbDevice::Connect),
+        InstanceMethod("disconnect", &UsbDevice::Disconnect),
+        InstanceMethod("sendPlt", &UsbDevice::SendPlt),
+        InstanceMethod("sendCmd", &UsbDevice::SendCmd),
+        InstanceMethod("getSendProgress", &UsbDevice::GetSendProgress),
+        InstanceMethod("startHotplugMonitor", &UsbDevice::StartHotplugMonitor),
+        InstanceMethod("stopHotplugMonitor", &UsbDevice::StopHotplugMonitor)
+    });
 
     constructor = Napi::Persistent(func);
     constructor.SuppressDestruct();
@@ -210,7 +218,7 @@ Napi::Value UsbDevice::Disconnect(const Napi::CallbackInfo &info)
     return Napi::Boolean::New(env, true);
 }
 
-Napi::Value UsbDevice::SendData(const Napi::CallbackInfo &info)
+Napi::Value UsbDevice::SendPlt(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
 
@@ -235,68 +243,95 @@ Napi::Value UsbDevice::SendData(const Napi::CallbackInfo &info)
 
     // 1. 取消所有待处理的 I/O 操作
     CancelIo(deviceHandle);
-    Sleep(10);
+    Sleep(10);  // 给设备一些时间处理取消操作
 
-    // 创建写入事件
-    HANDLE writeEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (!writeEvent)
-    {
-        Napi::Error::New(env, "Failed to create write event").ThrowAsJavaScriptException();
-        return env.Null();
-    }
-
-    // 初始化 OVERLAPPED 结构
-    OVERLAPPED osWrite = {0};
-    osWrite.hEvent = writeEvent;
-    osWrite.Offset = 0;
-    osWrite.OffsetHigh = 0;
-
+    // 2. 写入数据
     DWORD bytesWritten = 0;
     BOOL writeResult = WriteFile(
         deviceHandle,
         buffer.Data(),
         static_cast<DWORD>(buffer.Length()),
         &bytesWritten,
-        NULL);
+        NULL  // 不使用 OVERLAPPED
+    );
 
     if (!writeResult)
     {
         DWORD error = GetLastError();
-        if (error == ERROR_IO_PENDING)
-        {
-            // 等待写入完成
-            if (WaitForSingleObject(writeEvent, 5000) == WAIT_TIMEOUT)
-            {
-                CancelIo(deviceHandle);
-                CloseHandle(writeEvent);
-                Napi::Error::New(env, "Write operation timed out").ThrowAsJavaScriptException();
-                return env.Null();
-            }
+        std::cout << "Write operation failed with error: " << error << std::endl;
+        Napi::Error::New(env, "Failed to write data: " + std::to_string(error)).ThrowAsJavaScriptException();
+        return env.Null();
+    }
 
-            // 获取写入结果
-            if (!GetOverlappedResult(deviceHandle, &osWrite, &bytesWritten, TRUE))
+    std::cout << "Successfully wrote " << bytesWritten << " bytes" << std::endl;
+
+    // 3. 等待设备处理命令
+    Sleep(50);  // 给设备一些处理时间
+
+    // 4. 读取响应
+    const DWORD READ_BUFFER_SIZE = 1024;
+    std::vector<uint8_t> readBuffer(READ_BUFFER_SIZE);
+    DWORD bytesRead = 0;
+    bool responseReceived = false;
+    int readAttempts = 0;
+    const int MAX_READ_ATTEMPTS = 5;
+    DWORD startTime = GetTickCount();
+    const DWORD TIMEOUT = 500;
+
+    while (!responseReceived && readAttempts < MAX_READ_ATTEMPTS && (GetTickCount() - startTime) < TIMEOUT)
+    {
+        readAttempts++;
+        
+        // 使用同步读取
+        BOOL readResult = ReadFile(
+            deviceHandle,
+            readBuffer.data(),
+            READ_BUFFER_SIZE,
+            &bytesRead,
+            NULL  // 不使用 OVERLAPPED
+        );
+
+        if (!readResult)
+        {
+            DWORD error = GetLastError();
+            if (error == ERROR_NO_DATA)
             {
-                DWORD finalError = GetLastError();
-                CloseHandle(writeEvent);
-                Napi::Error::New(env, "Failed to complete write operation: " + std::to_string(finalError)).ThrowAsJavaScriptException();
-                return env.Null();
+                std::cout << "No data available, retrying..." << std::endl;
+                Sleep(10);
+            }
+            else
+            {
+                std::cout << "Error while reading response: " << error << std::endl;
             }
         }
-        else
+        else if (bytesRead > 0)
         {
-            CloseHandle(writeEvent);
-            Napi::Error::New(env, "Failed to write data: " + std::to_string(error)).ThrowAsJavaScriptException();
-            return env.Null();
+            responseReceived = true;
+            std::cout << "Received response of " << bytesRead << " bytes" << std::endl;
+            break;
+        }
+
+        if (!responseReceived)
+        {
+            Sleep(10);
         }
     }
 
-    CloseHandle(writeEvent);
+    // 5. 返回结果
+    if (responseReceived && bytesRead > 0)
+    {
+        CancelIo(deviceHandle);
+        Sleep(10);
+        // 创建一个新的缓冲区，只包含实际接收到的数据
+        std::vector<uint8_t> actualResponse(readBuffer.begin(), readBuffer.begin() + bytesRead);
+        return Napi::Buffer<uint8_t>::Copy(env, actualResponse.data(), actualResponse.size());
+    }
 
-    std::cout << "Successfully wrote " << bytesWritten << " bytes" << std::endl;
-    return Napi::Number::New(env, bytesWritten);
+    std::cout << "No valid response received after " << MAX_READ_ATTEMPTS << " attempts" << std::endl;
+    return env.Null();
 }
 
-Napi::Value UsbDevice::SendDataWithResponse(const Napi::CallbackInfo &info)
+Napi::Value UsbDevice::SendCmd(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
 
@@ -320,170 +355,162 @@ Napi::Value UsbDevice::SendDataWithResponse(const Napi::CallbackInfo &info)
             return env.Null();
         }
 
-        // 1. 取消所有待处理的 I/O 操作
-        CancelIo(deviceHandle);
-
-        // 2. 清空设备缓冲区
-        const DWORD CLEAR_BUFFER_SIZE = 1024;
-        std::vector<uint8_t> clearBuffer(CLEAR_BUFFER_SIZE);
-        HANDLE clearEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        
-        if (clearEvent) {
-            bool keepClearing = true;
-            int clearAttempts = 0;
-            const int MAX_CLEAR_ATTEMPTS = 5;
-
-            while (keepClearing && clearAttempts < MAX_CLEAR_ATTEMPTS) {
-                OVERLAPPED clearOverlapped = {0};
-                clearOverlapped.hEvent = clearEvent;
-                ResetEvent(clearEvent);
-
-                DWORD bytesRead = 0;
-                BOOL readResult = ReadFile(
-                    deviceHandle,
-                    clearBuffer.data(),
-                    CLEAR_BUFFER_SIZE,
-                    &bytesRead,
-                    &clearOverlapped);
-
-                if (!readResult && GetLastError() != ERROR_IO_PENDING) {
-                    break;
-                }
-
-                if (WaitForSingleObject(clearEvent, 50) != WAIT_OBJECT_0) {
-                    break;
-                }
-
-                if (!GetOverlappedResult(deviceHandle, &clearOverlapped, &bytesRead, FALSE) || bytesRead == 0) {
-                    keepClearing = false;
-                }
-
-                clearAttempts++;
-                std::cout << "Cleared " << bytesRead << " bytes from buffer" << std::endl;
-            }
-            CloseHandle(clearEvent);
-        }
-
-        // 3. 创建写入和读取事件
-        HANDLE writeEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        HANDLE readEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        if (!writeEvent || !readEvent) {
-            if (writeEvent) CloseHandle(writeEvent);
-            if (readEvent) CloseHandle(readEvent);
-            return env.Null();
-        }
-
-        // 4. 写入数据
-        OVERLAPPED writeOverlapped = {0};
-        writeOverlapped.hEvent = writeEvent;
-
-        std::cout << "Writing data: ";
-        for (size_t i = 0; i < buffer.Length(); i++) {
-            printf("%02X ", buffer.Data()[i]);
-        }
-        std::cout << std::endl;
-
+        // 2. 写入数据
         DWORD bytesWritten = 0;
-        ResetEvent(writeEvent);
         BOOL writeResult = WriteFile(
             deviceHandle,
             buffer.Data(),
             static_cast<DWORD>(buffer.Length()),
             &bytesWritten,
-            &writeOverlapped);
+            NULL  // 不使用 OVERLAPPED
+        );
 
-        if (!writeResult && GetLastError() != ERROR_IO_PENDING) {
-            CloseHandle(writeEvent);
-            CloseHandle(readEvent);
+        if (!writeResult)
+        {
+            DWORD error = GetLastError();
+            std::cout << "Write operation failed with error: " << error << std::endl;
+            
+            // 通过回调发送错误事件
+            auto errorEvent = new std::pair<EventType, std::string>(
+                EventType::ERR,
+                "Failed to write data: " + std::to_string(error)
+            );
+            
+            tsfn.BlockingCall(errorEvent, [](Napi::Env env, Napi::Function jsCallback, std::pair<EventType, std::string>* event) {
+                Napi::String eventType = Napi::String::New(env, "ERROR");
+                Napi::String message = Napi::String::New(env, event->second);
+                jsCallback.Call({eventType, message});
+                delete event;
+            });
+            
+            Napi::Error::New(env, "Failed to write data: " + std::to_string(error)).ThrowAsJavaScriptException();
             return env.Null();
         }
 
-        // 5. 等待写入完成
-        if (WaitForSingleObject(writeEvent, 500) != WAIT_OBJECT_0) {
-            CancelIo(deviceHandle);
-            CloseHandle(writeEvent);
-            CloseHandle(readEvent);
-            return env.Null();
-        }
+        std::cout << "Successfully wrote " << bytesWritten << " bytes" << std::endl;
 
-        // 6. 等待设备处理命令
-        Sleep(50);
+        // 3. 等待设备处理命令
+        Sleep(10);  // 给设备一些处理时间
 
-        // 7. 读取响应
+        // 4. 读取响应
         const DWORD READ_BUFFER_SIZE = 1024;
-        std::vector<uint8_t> readBuffer(READ_BUFFER_SIZE, 0);
-        std::vector<uint8_t> responseBuffer;
+        std::vector<uint8_t> readBuffer(READ_BUFFER_SIZE);
+        std::vector<uint8_t> completeResponse;  // 存储完整的响应数据
+        DWORD bytesRead = 0;
         bool responseReceived = false;
         int readAttempts = 0;
-        const int MAX_READ_ATTEMPTS = 3;
+        const int MAX_READ_ATTEMPTS = 3;  // 减少最大尝试次数
+        DWORD startTime = GetTickCount();
+        const DWORD TIMEOUT = 50;  // 减少超时时间到100ms
 
-        while (!responseReceived && readAttempts < MAX_READ_ATTEMPTS) {
+        while (!responseReceived && readAttempts < MAX_READ_ATTEMPTS && (GetTickCount() - startTime) < TIMEOUT)
+        {
             readAttempts++;
             
-            OVERLAPPED readOverlapped = {0};
-            readOverlapped.hEvent = readEvent;
-            ResetEvent(readEvent);
-
-            DWORD bytesRead = 0;
+            // 使用同步读取
             BOOL readResult = ReadFile(
                 deviceHandle,
                 readBuffer.data(),
                 READ_BUFFER_SIZE,
                 &bytesRead,
-                &readOverlapped);
+                NULL  // 不使用 OVERLAPPED
+            );
 
-            if (!readResult && GetLastError() != ERROR_IO_PENDING) { 
-                continue;
+            if (readResult && bytesRead > 0)
+            {
+                // 将读取到的数据添加到完整响应中
+                completeResponse.insert(completeResponse.end(), readBuffer.begin(), readBuffer.begin() + bytesRead);
+                std::cout << "Received " << bytesRead << " bytes, total: " << completeResponse.size() << " bytes" << std::endl;
+
+                // 检查最后一个字符是否为分号
+                if (!completeResponse.empty() && completeResponse.back() == ';')
+                {
+                    responseReceived = true;
+                    break;
+                }
             }
-
-            // 等待读取完成
-            DWORD waitResult = WaitForSingleObject(readEvent, 500);
-            if (waitResult == WAIT_OBJECT_0) {
-                if (GetOverlappedResult(deviceHandle, &readOverlapped, &bytesRead, FALSE)) {
-                    if (bytesRead > 0) {
-                        std::cout << "Read " << bytesRead << " bytes: ";
-                        for (DWORD i = 0; i < bytesRead; i++) {
-                            printf("%02X ", readBuffer[i]);
-                        }
-                        std::cout << std::endl;
-
-                        // 检查是否为有效响应
-                        bool isValidResponse = false;
-                        for (DWORD i = 0; i < bytesRead; i++) {
-                            if (readBuffer[i] != 0) {
-                                isValidResponse = true;
-                                break;
-                            }
-                        }
-
-                        if (isValidResponse) {
-                            responseBuffer.insert(responseBuffer.end(), 
-                                               readBuffer.begin(), 
-                                               readBuffer.begin() + bytesRead);
-                            responseReceived = true;
-                        }
+            else
+            {
+                DWORD error = GetLastError();
+                if (error == ERROR_NO_DATA)
+                {
+                    if (!completeResponse.empty())
+                    {
+                        responseReceived = true;
+                        break;
                     }
+                }
+                else
+                {
+                    std::cout << "Error while reading response: " << error << std::endl;
                 }
             }
 
-            if (!responseReceived) {
-                Sleep(20);
+            if (!responseReceived)
+            {
+                std::cout << "No response received, retrying..." << std::endl;
+                Sleep(5);  // 短暂等待后重试
             }
         }
 
-        // 8. 清理资源
-        CloseHandle(writeEvent);
-        CloseHandle(readEvent);
-
-        // 9. 返回结果
-        if (responseReceived && !responseBuffer.empty()) {
-            return Napi::Buffer<uint8_t>::Copy(env, responseBuffer.data(), responseBuffer.size());
+        // 5. 通过回调返回结果
+        if (responseReceived && !completeResponse.empty())
+        {
+            std::cout << "Total response size: " << completeResponse.size() << " bytes" << std::endl;
+            
+            // 创建一个新的缓冲区来存储响应数据
+            auto responseBuffer = new std::vector<uint8_t>(completeResponse);
+            
+            // 通过回调发送数据
+            tsfn.BlockingCall(responseBuffer, [](Napi::Env env, Napi::Function jsCallback, std::vector<uint8_t>* response) {
+                // 创建事件类型字符串
+                Napi::String eventType = Napi::String::New(env, "CMD_RESPONSE");
+                
+                // 创建 Buffer 对象
+                Napi::Buffer<uint8_t> buffer = Napi::Buffer<uint8_t>::Copy(env, response->data(), response->size());
+                
+                // 调用 JavaScript 回调
+                jsCallback.Call({eventType, buffer});
+                
+                // 清理
+                delete response;
+            });
+        }
+        else
+        {
+            std::cout << "No valid response received after " << MAX_READ_ATTEMPTS << " attempts" << std::endl;
+            // 通过回调发送错误事件
+            auto errorEvent = new std::pair<EventType, std::string>(
+                EventType::ERR,
+                "No valid response received after " + std::to_string(MAX_READ_ATTEMPTS) + " attempts"
+            );
+            
+            tsfn.BlockingCall(errorEvent, [](Napi::Env env, Napi::Function jsCallback, std::pair<EventType, std::string>* event) {
+                Napi::String eventType = Napi::String::New(env, "ERROR");
+                Napi::String message = Napi::String::New(env, event->second);
+                jsCallback.Call({eventType, message});
+                delete event;
+            });
         }
 
         return env.Null();
     }
     catch (const std::exception& e) {
         std::cout << "Exception: " << e.what() << std::endl;
+        
+        // 通过回调发送错误事件
+        auto errorEvent = new std::pair<EventType, std::string>(
+            EventType::ERR,
+            std::string("Exception: ") + e.what()
+        );
+        
+        tsfn.BlockingCall(errorEvent, [](Napi::Env env, Napi::Function jsCallback, std::pair<EventType, std::string>* event) {
+            Napi::String eventType = Napi::String::New(env, "ERROR");
+            Napi::String message = Napi::String::New(env, event->second);
+            jsCallback.Call({eventType, message});
+            delete event;
+        });
+        
         return env.Null();
     }
 }
@@ -504,11 +531,11 @@ LRESULT CALLBACK UsbDevice::WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
             const char *eventType = nullptr;
             if (wParam == DBT_DEVICEARRIVAL)
             {
-                eventType = "Arrival";
+                eventType = "HOTPLUG";
             }
             else if (wParam == DBT_DEVICEREMOVECOMPLETE)
             {
-                eventType = "Remove";
+                eventType = "HOTPLUG";
             }
 
             if (eventType)
@@ -534,19 +561,27 @@ LRESULT CALLBACK UsbDevice::WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
                     std::string type;
                     std::string vid;
                     std::string pid;
+                    std::string action;  // "Arrival" 或 "Remove"
                 };
 
-                auto event = new HotplugEvent{eventType, vid, pid};
+                auto event = new HotplugEvent{
+                    eventType,
+                    vid,
+                    pid,
+                    (wParam == DBT_DEVICEARRIVAL) ? "Arrival" : "Remove"
+                };
 
                 device->tsfn.BlockingCall(event, [](Napi::Env env, Napi::Function jsCallback, HotplugEvent *event)
                                           {
                     // 创建参数
                     Napi::String jsEventType = Napi::String::New(env, event->type);
-                    Napi::String jsVid = Napi::String::New(env, event->vid);
-                    Napi::String jsPid = Napi::String::New(env, event->pid);
+                    Napi::Object jsData = Napi::Object::New(env);
+                    jsData.Set("vid", Napi::String::New(env, event->vid));
+                    jsData.Set("pid", Napi::String::New(env, event->pid));
+                    jsData.Set("action", Napi::String::New(env, event->action));
 
                     // 调用JavaScript回调
-                    jsCallback.Call({jsEventType, jsVid, jsPid});
+                    jsCallback.Call({jsEventType, jsData});
 
                     // 清理
                     delete event; });
@@ -667,3 +702,4 @@ Napi::Object Init(Napi::Env env, Napi::Object exports)
 }
 
 NODE_API_MODULE(usb_addon, Init)
+
